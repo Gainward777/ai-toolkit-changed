@@ -9,7 +9,9 @@ from diffusers import T2IAdapter, AutoencoderTiny, ControlNetModel
 import torch.functional as F
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader, ConcatDataset
-
+from toolkit.util.texture_losses import SpectralPeriodLoss, LogPolarAlignLoss, ScaleConsistencyLoss, ACFPeriodLoss
+from toolkit.util.local_texture import LocalTextureRegularityLoss
+from toolkit.util.phase_correlation_loss import PhaseCorrelationLoss
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
@@ -34,7 +36,7 @@ from diffusers import EMAModel
 import math
 from toolkit.train_tools import precondition_model_outputs_flow_match
 from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtractor, load_dfe
-from toolkit.util.losses import wavelet_loss, stepped_loss
+from toolkit.util.losses import wavelet_loss, stepped_loss, mse_l1_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
 from PIL import Image
@@ -48,7 +50,7 @@ def flush():
 
 adapter_transforms = transforms.Compose([
     transforms.ToTensor(),
-])
+])  
 
 
 class SDTrainer(BaseSDTrainProcess):
@@ -60,6 +62,63 @@ class SDTrainer(BaseSDTrainProcess):
         self.do_long_prompts = False
         self.do_guided_loss = False
         self.taesd: Optional[AutoencoderTiny] = None
+        self.current_step = 0
+
+        self.local_texture_loss = LocalTextureRegularityLoss(
+            patch_size= self.train_config.local_patch_size,
+            stride=self.train_config.local_stride,
+            min_coverage=self.train_config.local_min_coverage,
+            w_spectral=self.train_config.local_w_spectral, 
+            w_afc=self.train_config.local_w_afc,       
+            w_phase=self.train_config.local_w_phase,     
+            w_log = self.train_config.local_w_log,
+            phase_center_weight = self.train_config.center_weight,
+            phase_pce_weight = self.train_config.pce_weight,
+            phase_temperature = self.train_config.temperature,
+            phase_use_hann = self.train_config.use_hann,
+            phase_demean = self.train_config.demean,
+            phase_exclude_radius = self.train_config.exclude_radius,
+            spectral_r_bins = self.train_config.r_bins,    
+            spectral_tau = self.train_config.tau,
+            spectral_band_sigma = self.train_config.band_sigma,
+            spectral_w_peak = self.train_config.w_peak,
+            spectral_w_band = self.train_config.w_band,
+            spectral_min_bin = self.train_config.min_bin,
+            spectral_max_bin = self.train_config.max_bin, 
+            afc_r_bins = self.train_config.afc_r_bins,
+            afc_tau = self.train_config.afc_tau,
+            afc_min_rel = self.train_config.afc_min_rel,
+            afc_max_rel = self.train_config.afc_max_rel,
+            afc_w = self.train_config.afc_w,
+            log_out_r = self.train_config.log_out_r,
+            log_out_t = self.train_config.log_out_t,
+            log_r_min = self.train_config.log_r_min,
+            log_w = self.train_config.log_w,
+
+
+        )
+        self.phase_loss = PhaseCorrelationLoss(
+            self.train_config.center_weight,
+            self.train_config.pce_weight,
+            self.train_config.temperature,
+            self.train_config.use_hann,
+            self.train_config.demean,
+            self.train_config.exclude_radius,
+        )
+        self.spectral_period_loss = SpectralPeriodLoss(
+            self.train_config.r_bins,self.train_config.tau, self.train_config.band_sigma,
+            self.train_config.w_peak, self.train_config.w_band,
+            self.train_config.min_bin, self.train_config.max_bin,
+        )
+        self.logpolar_loss = LogPolarAlignLoss(
+            self.train_config.log_out_r, self.train_config.log_out_t, self.train_config.log_r_min, self.train_config.log_w,
+        )
+        self.acf_period_loss = ACFPeriodLoss(
+            self.train_config.afc_r_bins, self.train_config.afc_tau, self.train_config.afc_min_rel, self.train_config.afc_max_rel, self.train_config.afc_w,
+        )
+        self.scale_consistency_loss = ScaleConsistencyLoss(
+             r_bins=256, tau=0.06, min_bin=2, max_bin=None, w=1.0
+        )
 
         self._clip_image_embeds_unconditional: Union[List[str], None] = None
         self.negative_prompt_pool: Union[List[str], None] = None
@@ -453,9 +512,21 @@ class SDTrainer(BaseSDTrainProcess):
             self.sd.noise_scheduler.config.num_train_timesteps,
             device=self.device_torch
         )
+        vae = self.sd.vae
+        scaling_factor = vae.config.get("scaling_factor", 1.0)
 
-        output = denoised_latents / self.sd.vae.config['scaling_factor']
-        output = self.sd.vae.decode(output).sample
+        output_latents = denoised_latents
+
+        # --- FIX: QwenImage VAE expects 5D latents (B,C,T,H,W) ---
+        if self.train_config.is_Qwen and output_latents.ndim == 4:
+            output_latents = output_latents.unsqueeze(2)  # (B,C,1,H,W)
+
+        output = vae.decode(output_latents / scaling_factor).sample
+
+        # bring decoded back to 4D (B,C,H,W) if we had T=1
+        if output.ndim == 5 and output.shape[2] == 1:
+            output = output[:, :, 0]
+
 
         if self.train_config.show_turbo_outputs:
             # since we are completely denoising, we can show them here
@@ -726,34 +797,73 @@ class SDTrainer(BaseSDTrainProcess):
 
         if loss_target == 'source' or loss_target == 'unaugmented':
             assert not self.train_config.train_turbo
-            # ignore_snr = True
-            if batch.sigmas is None:
-                raise ValueError("Batch sigmas is None. This should not happen")
 
-            # src https://github.com/huggingface/diffusers/blob/324d18fba23f6c9d7475b0ff7c777685f7128d40/examples/t2i_adapter/train_t2i_adapter_sdxl.py#L1190
-            denoised_latents = noise_pred * (-batch.sigmas) + noisy_latents
-            weighing = batch.sigmas ** -2.0
+            # --------- берём sigmas из scheduler по timesteps ---------
+            # timesteps: обычно shape [B] или [B, 1]
+            if timesteps.dim() > 1:
+                t_flat = timesteps.view(-1)
+            else:
+                t_flat = timesteps
+
+            # индекс сигмы для каждого t (ДЕЛАЕМ НА CPU!)
+            sigma_indices = [
+                self.sd.noise_scheduler.index_for_timestep(int(t.item()))
+                for t in t_flat
+            ]
+            # индексы на том же девайсе, что и sigmas (обычно cpu)
+            sigmas_tensor = self.sd.noise_scheduler.sigmas
+            sigma_indices = torch.tensor(
+                sigma_indices, device=sigmas_tensor.device, dtype=torch.long
+            )
+
+            # сначала индексируем на CPU, потом переносим на девайс модели
+            sigmas_flat = sigmas_tensor[sigma_indices].to(
+                noise_pred.device, dtype=noise_pred.dtype
+            )  # [B]
+
+            # приведём sigmas к виду [B, 1, 1, 1(,1)] под размер noise_pred
+            sigma_shape = [sigmas_flat.shape[0]] + [1] * (noise_pred.dim() - 1)
+            sigmas = sigmas_flat.view(*sigma_shape)  # Bx1x1x1 или Bx1x1x1x1
+
+            # --------- денойзим латенты: x0 ≈ xt - σ * εθ ---------
+            denoised_latents = noisy_latents - sigmas * noise_pred
+
+            # веса: σ^-2, скаляры на батч: [B]
+            weighing_flat = sigmas_flat ** -2.0
+            w_shape = [weighing_flat.shape[0]] + [1] * (denoised_latents.dim() - 1)
+            weighing = weighing_flat.view(*w_shape)
+            # --------- задаём target ---------
             if loss_target == 'source':
-                # denoise the latent and compare to the latent in the batch
-                target = batch.latents
+                # сравниваем с латентами из батча
+                target = batch.latents.to(denoised_latents.device, dtype=denoised_latents.dtype)
+
             elif loss_target == 'unaugmented':
-                # we have to encode images into latents for now
-                # we also denoise as the unaugmented tensor is not a noisy diffirental
                 with torch.no_grad():
-                    unaugmented_latents = self.sd.encode_images(batch.unaugmented_tensor).to(self.device_torch, dtype=dtype)
+                    unaugmented_latents = self.sd.encode_images(
+                        batch.unaugmented_tensor
+                    ).to(self.device_torch, dtype=dtype)
                     unaugmented_latents = unaugmented_latents * self.train_config.latent_multiplier
                     target = unaugmented_latents.detach()
 
-                # Get the target for loss depending on the prediction type
+                # приводим target к тому виду, который ожидает prediction_type
                 if self.sd.noise_scheduler.config.prediction_type == "epsilon":
-                    target = target  # we are computing loss against denoise latents
+                    # x0-таргет: сравниваем денойзнутые латенты с "чистыми"
+                    target = target.to(denoised_latents.device, dtype=denoised_latents.dtype)
                 elif self.sd.noise_scheduler.config.prediction_type == "v_prediction":
-                    target = self.sd.noise_scheduler.get_velocity(target, noise, timesteps)
+                    # тут уже таргет не x0, а скорость
+                    target = self.sd.noise_scheduler.get_velocity(
+                        target.to(noise.device, dtype=noise.dtype),
+                        noise,
+                        timesteps,
+                    ).to(denoised_latents.device, dtype=denoised_latents.dtype)
                 else:
-                    raise ValueError(f"Unknown prediction type {self.sd.noise_scheduler.config.prediction_type}")
+                    raise ValueError(
+                        f"Unknown prediction type {self.sd.noise_scheduler.config.prediction_type}"
+                    )
 
-            # mse loss without reduction
-            loss_per_element = (weighing.float() * (denoised_latents.float() - target.float()) ** 2)
+            # --------- считаем loss без редукции ---------
+            diff = denoised_latents.float() - target.float()
+            loss_per_element = weighing.float() * (diff ** 2)
             loss = loss_per_element
         else:
 
@@ -765,7 +875,11 @@ class SDTrainer(BaseSDTrainProcess):
                 loss = stepped_loss(pred, batch.latents, noise, noisy_latents, timesteps, self.sd.noise_scheduler)
                 # the way this loss works, it is low, increase it to match predictable LR effects
                 loss = loss * 10.0
+            elif self.train_config.loss_type == "mse_l1":
+                print("In mse_l1")
+                loss = mse_l1_loss(pred.float(), target.float())
             else:
+                print("default")
                 loss = torch.nn.functional.mse_loss(pred.float(), target.float(), reduction="none")
                 
             do_weighted_timesteps = False
@@ -860,20 +974,154 @@ class SDTrainer(BaseSDTrainProcess):
 
         loss = loss.mean()
 
-        # check for additional losses
-        if self.adapter is not None and hasattr(self.adapter, "additional_loss") and self.adapter.additional_loss is not None:
 
-            loss = loss + self.adapter.additional_loss.mean()
-            self.adapter.additional_loss = None
+        if (
+            not self.train_config.train_turbo
+            and self.train_config.texture_loss in (
+                "custom",
+                "SpectralPeriodLoss",
+                "LogPolarAlignLoss",
+                "ScaleConsistencyLoss",
+                "Phase",
+                "local"
+            )
+        ):
+            vae = self.sd.vae
+            scaling_factor = vae.config.get("scaling_factor", 1.0)
 
-        if self.train_config.target_norm_std:
-            # seperate out the batch and channels
-            pred_std = noise_pred.std([2, 3], keepdim=True)
-            norm_std_loss = torch.abs(self.train_config.target_norm_std_value - pred_std).mean()
-            loss = loss + norm_std_loss
+            tgt_latents_vae = batch.latents.to(vae.device, dtype=vae.dtype)
+
+            alpha = 0.1
+
+            step = self.current_step
+            warmup_steps = 2000
+
+            latents_for_pred = batch.latents.to(
+                noise_pred.device, dtype=noise_pred.dtype
+            )
+            c_lat = latents_for_pred.shape[1]
+            c_pred = noise_pred.shape[1]
+
+            if c_pred == c_lat:
+                proj = noise_pred
+            elif c_pred > c_lat:
+                proj = noise_pred[:, :c_lat, :, :]
+            else:
+                pad_ch = c_lat - c_pred
+                pad = torch.zeros(
+                    noise_pred.shape[0],
+                    pad_ch,
+                    noise_pred.shape[2],
+                    noise_pred.shape[3],
+                    device=noise_pred.device,
+                    dtype=noise_pred.dtype,
+                )
+                proj = torch.cat([noise_pred, pad], dim=1)
+
+            pred_latents_vae = (latents_for_pred + alpha * proj).to(
+                vae.device, dtype=vae.dtype 
+            )
+            if self.train_config.is_Qwen:
+                print("Qwen")
+                if pred_latents_vae.ndim == 4:
+                    pred_latents_vae = pred_latents_vae.unsqueeze(2)  # (B,C,1,H,W)
+                if tgt_latents_vae.ndim == 4:
+                    tgt_latents_vae = tgt_latents_vae.unsqueeze(2)    # (B,C,1,H,W)
+
+            pred_imgs = vae.decode(pred_latents_vae / scaling_factor).sample
+            tgt_imgs = vae.decode(tgt_latents_vae / scaling_factor).sample
+
+            if self.train_config.is_Qwen:
+                print("Qwen_2")
+                if pred_imgs.ndim == 5 and pred_imgs.shape[2] == 1:
+                    pred_imgs = pred_imgs[:, :, 0]
+                if tgt_imgs.ndim == 5 and tgt_imgs.shape[2] == 1:
+                    tgt_imgs = tgt_imgs[:, :, 0]
+
+            # <<< ВАЖНО: перевести в float32 для FFT >>>
+            pred_imgs = pred_imgs.float()
+            tgt_imgs = tgt_imgs.float()
+
+            if batch.mask_tensor is not None and len(pred_imgs.shape) == 4:
+                print('mask_full')
+                mask_img = batch.mask_tensor.to(
+                    vae.device, dtype=pred_imgs.dtype
+                )
+                mask_img = torch.nn.functional.interpolate(
+                    mask_img,
+                    size=pred_imgs.shape[-2:],
+                    mode="bicubic",
+                    align_corners=False,
+                )
+            else:
+                if len(pred_imgs.shape) == 4:
+                    print('mask_one')
+                    mask_img = torch.ones(
+                        pred_imgs.shape[0],
+                        1,
+                        pred_imgs.shape[2],
+                        pred_imgs.shape[3],
+                        device=vae.device,
+                        dtype=pred_imgs.dtype,
+                    )
+                else:
+                    mask_img = None
 
 
-        return loss + additional_loss
+            
+            if mask_img is not None:
+                mask_img = mask_img.float()
+                beta = min(1.0, float(step) / float(warmup_steps))
+                final_beta = self.train_config.min_beta + beta * (self.train_config.max_beta - self.train_config.min_beta)
+                if self.train_config.texture_loss == "custom":
+                    print("custom with coef")
+                    tex_sp = self.spectral_period_loss(pred_imgs, tgt_imgs, mask_img)
+                    tex_lp = self.logpolar_loss(pred_imgs, tgt_imgs, mask_img)
+                    tex_acf = self.acf_period_loss(pred_imgs, tgt_imgs, mask_img)
+                    tex_ph = self.phase_loss(pred_imgs, tgt_imgs, mask_img)
+                    additional_loss = additional_loss + (self.train_config.loss_Spect_coef * tex_sp + self.train_config.loss_Log_coef * tex_lp + self.train_config.loss_AFC_coef * tex_acf + self.train_config.loss_Phase_coef * tex_ph)
+                    if step % 50 == 0:  # лог
+                        diag = self.phase_loss.diagnostics(pred_imgs, tgt_imgs, mask_img)
+                        print(
+                            f"[step {step}] PCL diag: "
+                            f"center_prob={diag['center_prob']:.3f}  PCE={diag['PCE']:.2f}"
+                        )
+                elif self.train_config.texture_loss == "Phase":
+                    print("Phase")
+                    tex_ph = self.phase_loss(pred_imgs, tgt_imgs, mask_img)
+                    additional_loss = additional_loss + tex_ph
+                    if step % 50 == 0:  # лог
+                        diag = self.phase_loss.diagnostics(pred_imgs, tgt_imgs, mask_img)
+                        print(
+                            f"[step {step}] PCL diag: "
+                            f"center_prob={diag['center_prob']:.3f}  PCE={diag['PCE']:.2f}")
+                elif self.train_config.texture_loss == "SpectralPeriodLoss":
+                    print("SpectralPeriodLoss")
+                    tex_sp = self.spectral_period_loss(pred_imgs, tgt_imgs, mask_img)
+                    additional_loss = additional_loss +  tex_sp
+
+                elif self.train_config.texture_loss == "LogPolarAlignLoss":
+                    print("LogPolarAlignLoss")
+                    tex_lp = self.logpolar_loss(pred_imgs, tgt_imgs, mask_img)
+                    additional_loss = additional_loss + tex_lp
+
+                elif self.train_config.texture_loss == "ACFPeriodLoss":
+                    print("ACFPerdiodLoss")
+                    tex_acf = self.acf_period_loss(pred_imgs, tgt_imgs, mask_img)
+                    additional_loss = additional_loss + tex_acf
+
+                elif self.train_config.texture_loss == "local":
+                    print("local")
+                    tex_local = self.local_texture_loss(pred_imgs, tgt_imgs, mask_img)
+                    additional_loss = additional_loss + tex_local
+                print(f"BETA: {final_beta}")
+                print(f"LOSS {loss} and {additional_loss}")
+                return loss + final_beta * additional_loss
+        return loss
+
+
+
+
 
     def preprocess_batch(self, batch: 'DataLoaderBatchDTO'):
         return batch
@@ -2073,7 +2321,7 @@ class SDTrainer(BaseSDTrainProcess):
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()
-
+                self.current_step += 1
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):
                     self.adapter.post_weight_update()

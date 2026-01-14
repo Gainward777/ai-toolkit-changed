@@ -1,5 +1,5 @@
 import torch
-
+import torch.nn.functional as F
 
 _dwt = None
 
@@ -16,7 +16,16 @@ def _get_wavelet_loss(device, dtype):
     dwt = DWTForward(J=1, mode="zero", wave="haar").to(device=device, dtype=dtype)
     _dwt = dwt
     return dwt
+###################PETR_CUSTOM_LOSSES####################
 
+##########################################################
+
+def mse_l1_loss(model_pred: torch.Tensor,
+                target: torch.Tensor) -> torch.Tensor:
+    print("In mse_l1 part ...")
+    return 0.3 * F.mse_loss(model_pred, target, reduction="none") + 1.0 * F.l1_loss(model_pred, target, reduction="none")
+
+##########################################################
 
 def wavelet_loss(model_pred, latents, noise):
     model_pred = model_pred.float()

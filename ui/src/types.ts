@@ -138,10 +138,50 @@ export interface TrainConfig {
   blank_prompt_preservation?: boolean;
   blank_prompt_preservation_multiplier?: number;
   switch_boundary_every: number;
-  loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped';
+  texture_loss: | 'SpectralPeriodLoss' | 'LogPolarAlignLoss' | 'ScaleConsistencyLoss' | 'ACFPeriodLoss' | 'сustom' | 'default' | 'Phase' | 'local';
+  loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped' | 'mse_l1';
+  is_Qwen: boolean;
+  is_new: boolean;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
-}
+  loss_coef: number;
+  loss_Spect_coef: number;
+  loss_Log_coef: number;
+  loss_Scale_coef: number;
+  loss_AFC_coef: number;
+  loss_Phase_coef: number;
+  min_beta:number;
+  max_beta:number;
+  r_bins: number;
+  tau: number;
+  band_sigma: number; 
+  w_peak: number; 
+  w_band: number; 
+  min_bin: number; 
+  max_bin: number; 
+  log_out_r: number; 
+  log_out_t: number; 
+  log_r_min: number; 
+  log_w: number; 
+  afc_r_bins: number; 
+  afc_tau: number; 
+  afc_min_rel: number; 
+  afc_max_rel: number; 
+  afc_w: number;
+  center_weight: number;
+  pce_weight: number;
+  temperature: number;
+  use_hann: boolean;
+  demean: boolean;
+  exclude_radius: number;
+  local_patch_size: number;
+  local_stride: number;
+  local_min_coverage: number;
+  local_w_spectral: number;
+  local_w_afc: number;       
+  local_w_phase: number;
+  local_w_log: number;
+   }
 
 export interface QuantizeKwargsConfig {
   exclude: string[];

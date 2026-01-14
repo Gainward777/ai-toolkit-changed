@@ -482,6 +482,52 @@ class TrainConfig:
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
         self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow
+        self.is_Qwen = kwargs.get('is_Qwen', False)
+        self.is_new = kwargs.get('is_new', False)
+        self.texture_loss = kwargs.get('texture_loss', 'custom')
+        self.loss_coef = kwargs.get('loss_coef', 0.0)
+        self.loss_Spect_coef = kwargs.get('loss_Spect_coef', 0.0)
+        self.loss_Log_coef = kwargs.get('loss_Log_coef', 0.0)
+        self.loss_Scale_coef = kwargs.get('loss_Scale_coef', 0.0)
+        self.loss_AFC_coef = kwargs.get('loss_AFC_coef', 0.0)
+        self.loss_Phase_coef = kwargs.get('loss_Phase_coef', 0.0)
+        self.loss_local_coef = kwargs.get('loss_local_coef', 0.0)
+
+        self.min_beta = kwargs.get('min_beta', 0.0)
+        self.max_beta = kwargs.get('max_beta', 0.5)
+        self.r_bins = kwargs.get('r_bins', 256)
+        self.tau = kwargs.get('tau', 0.06)
+        self.band_sigma = kwargs.get('band_sigma', 0.15)
+        self.w_peak = kwargs.get('w_peak', 1.0)
+        self.w_band = kwargs.get('w_band', 1.0)
+        self.min_bin = kwargs.get('min_bin', 2)
+        self.max_bin = kwargs.get('max_bin', None)
+
+        self.log_out_r = kwargs.get('log_out_r', 128)
+        self.log_out_t = kwargs.get('log_out_t', 180)
+        self.log_r_min = kwargs.get('log_r_min', 1e-2)
+        self.log_w = kwargs.get('log_w', 1.0)
+
+        self.afc_r_bins = kwargs.get('afc_r_bins', 256)
+        self.afc_tau = kwargs.get('afc_tau', 0.08)
+        self.afc_min_rel = kwargs.get('afc_min_rel', 0.03)
+        self.afc_max_rel = kwargs.get('afc_max_rel', 0.6)
+        self.afc_w = kwargs.get('afc_w', 1.0)
+        
+        self.center_weight = kwargs.get('center_weight', 1.0)
+        self.pce_weight = kwargs.get('pce_weight', 0.1)
+        self.temperature = kwargs.get('temperature', 0.02)
+        self.use_hann = kwargs.get('use_hann', True)
+        self.demean = kwargs.get('demean', True)
+        self.exclude_radius = kwargs.get('exclude_radius', 7)
+
+        self.local_patch_size = kwargs.get('local_patch_size', 64)
+        self.local_stride = kwargs.get('local_stride', 32)
+        self.local_min_coverage = kwargs.get('local_min_coverage', 0.3)
+        self.local_w_spectral = kwargs.get('local_w_spectral', 0.5)
+        self.local_w_afc = kwargs.get('local_w_afc', 1.5)
+        self.local_w_phase = kwargs.get('local_w_phase', 1.2)   
+        self.local_w_log = kwargs.get('local_w_log', 0.0)
 
         # scale the prediction by this. Increase for more detail, decrease for less
         self.pred_scaler = kwargs.get('pred_scaler', 1.0)

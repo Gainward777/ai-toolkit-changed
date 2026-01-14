@@ -2,13 +2,14 @@ FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 
 LABEL authors="jaret"
 
-# Set noninteractive to avoid timezone prompts
+# Чтобы apt не задавал вопросы про timezone
 ENV DEBIAN_FRONTEND=noninteractive
 
-# ref https://en.wikipedia.org/wiki/CUDA
-ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0"
+# (опционально) актуальные архитектуры для компиляции CUDA-опов
+# Если что-то компилируется из исходников (flash-attn и т.п.)
+ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0"
 
-# Install dependencies
+# Базовые зависимости
 RUN apt-get update && apt-get install --no-install-recommends -y \
     git \
     curl \
@@ -34,49 +35,52 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install nodejs
+# Node.js (LTS достаточно для Next.js UI)
 WORKDIR /tmp
-RUN curl -sL https://deb.nodesource.com/setup_23.x -o nodesource_setup.sh && \
+RUN curl -sL https://deb.nodesource.com/setup_20.x -o nodesource_setup.sh && \
     bash nodesource_setup.sh && \
     apt-get update && \
     apt-get install -y nodejs && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
-# Set aliases for python and pip
-RUN ln -s /usr/bin/python3 /usr/bin/python
-
-# install pytorch before cache bust to avoid redownloading pytorch
-RUN pip install --pre --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
-
-# Fix cache busting by moving CACHEBUST to right before git clone
-ARG CACHEBUST=1234
-ARG GIT_COMMIT=main
-RUN echo "Cache bust: ${CACHEBUST}" && \
-    git clone https://github.com/ostris/ai-toolkit.git && \
-    cd ai-toolkit && \
-    git checkout ${GIT_COMMIT}
-
+# Рабочая директория проекта
 WORKDIR /app/ai-toolkit
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --pre --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128 --force && \
-    pip install setuptools==69.5.1 --no-cache-dir
+# Копируем весь репозиторий внутрь контейнера
+# ВАЖНО: билд запускать из корня: docker build -f docker/Dockerfile .
+COPY . .
 
-# Build UI
+# Алиасы для python / pip
+RUN ln -s /usr/bin/python3 /usr/bin/python || true && \
+    ln -s /usr/bin/pip3 /usr/bin/pip || true
+
+# Сначала ставим PyTorch (как в README ai-toolkit: torch 2.7.0 + cu126)
+# cu126 отлично работает с драйвером/рантаймом 12.8
+RUN pip install --no-cache-dir \
+    torch==2.7.0 \
+    torchvision==0.22.0 \
+    torchaudio==2.7.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# Остальные Python-зависимости
+RUN pip install --no-cache-dir -r requirements.txt
+
+# (опционально) если понадобятся подмодули, раскомментируй:
+# RUN git submodule update --init --recursive
+
+# Cборка UI
 WORKDIR /app/ai-toolkit/ui
-RUN npm install && \
-    npm run build && \
-    npm run update_db
 
-# Expose port (assuming the application runs on port 3000)
+RUN npm install && \
+    npm run update_db && \
+    npm run build
+
+# Порт UI
 EXPOSE 8675
 
+# Стартовый скрипт (он уже есть в репо в папке docker)
 WORKDIR /
-
 COPY docker/start.sh /start.sh
 RUN chmod +x /start.sh
 

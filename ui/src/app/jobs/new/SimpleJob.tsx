@@ -535,6 +535,12 @@ export default function SimpleJob({
                     { value: 'mae', label: 'Mean Absolute Error' },
                     { value: 'wavelet', label: 'Wavelet' },
                     { value: 'stepped', label: 'Stepped Recovery' },
+                    { value: 'mse_l1', label: 'Mse + L1'},
+                    { value: 'SpectralPeriodLoss', label: 'SpectralPeriodLoss'},
+                    { value: 'LogPolarAlignLoss', label: 'LogPolarAlignLoss'},
+                    { value: 'ScaleConsistencyLoss', label: 'ScaleConsistencyLoss'},
+                    { value: 'ACFPeriodLoss', label: 'ACFPeriodLoss'},
+                    { value: 'custom', label: 'Custom by Petr'},
                   ]}
                 />
               </div>
