@@ -18,6 +18,7 @@ from toolkit.accelerator import get_accelerator, unwrap_model
 from optimum.quanto import freeze, QTensor
 from toolkit.util.mask import generate_random_mask, random_dialate_mask
 from toolkit.util.quantize import quantize, get_qtype
+from toolkit.memory_management import MemoryManager
 from transformers import T5TokenizerFast, T5EncoderModel, CLIPTextModel, CLIPTokenizer
 from einops import rearrange, repeat
 import random
@@ -61,6 +62,9 @@ class FluxKontextModel(BaseModel):
         self.is_flow_matching = True
         self.is_transformer = True
         self.target_lora_modules = ['FluxTransformer2DModel']
+        # Cache for large per-step tensors to reduce allocations/fragmentation (important on low-VRAM GPUs)
+        self._img_ids_cache = {}
+        self._txt_ids_cache = {}
 
     # static method to get the noise scheduler
     @staticmethod
@@ -69,6 +73,47 @@ class FluxKontextModel(BaseModel):
 
     def get_bucket_divisibility(self):
         return 16
+
+    def _get_cached_txt_ids(self, bs: int, seq_len: int, device: torch.device) -> torch.Tensor:
+        # Keep dtype as float32 to match existing behavior (torch.zeros default) and avoid subtle model expectations.
+        key = (str(device), bs, seq_len)
+        cached = self._txt_ids_cache.get(key, None)
+        if cached is not None and cached.device == device:
+            return cached
+        txt_ids = torch.zeros((bs, seq_len, 3), device=device, dtype=torch.float32)
+        # Keep cache bounded (best-effort)
+        if len(self._txt_ids_cache) > 32:
+            self._txt_ids_cache.clear()
+        self._txt_ids_cache[key] = txt_ids
+        return txt_ids
+
+    def _get_cached_img_ids(self, bs: int, h: int, w: int, device: torch.device, has_control: bool) -> torch.Tensor:
+        # h,w are latent H/W. Flux uses packed spatial ids at (h//2, w//2).
+        hh = h // 2
+        ww = w // 2
+        key = (str(device), bs, hh, ww, bool(has_control))
+        cached = self._img_ids_cache.get(key, None)
+        if cached is not None and cached.device == device:
+            return cached
+
+        hw = hh * ww
+        base = torch.zeros((hw, 3), device=device, dtype=torch.float32)
+        # Column 1: y positions, Column 2: x positions (matches previous repeat/torch.arange logic)
+        base[:, 1] = torch.arange(hh, device=device, dtype=torch.float32).repeat_interleave(ww)
+        base[:, 2] = torch.arange(ww, device=device, dtype=torch.float32).repeat(hh)
+
+        img_ids = base.unsqueeze(0).expand(bs, -1, -1).contiguous()
+
+        if has_control:
+            ctrl_ids = img_ids.clone()
+            ctrl_ids[..., 0] = 1.0
+            img_ids = torch.cat([img_ids, ctrl_ids], dim=1)
+
+        # Keep cache bounded (best-effort)
+        if len(self._img_ids_cache) > 32:
+            self._img_ids_cache.clear()
+        self._img_ids_cache[key] = img_ids
+        return img_ids
 
     def load_model(self):
         dtype = self.torch_dtype
@@ -107,8 +152,21 @@ class FluxKontextModel(BaseModel):
             quantize(transformer, weights=quantization_type,
                      **self.model_config.quantize_kwargs)
             freeze(transformer)
+            # Optional: layer offloading to reduce VRAM pressure (esp. on low-VRAM GPUs)
+            if self.model_config.layer_offloading and self.model_config.layer_offloading_transformer_percent > 0:
+                MemoryManager.attach(
+                    transformer,
+                    self.device_torch,
+                    offload_percent=self.model_config.layer_offloading_transformer_percent
+                )
             transformer.to(self.device_torch)
         else:
+            if self.model_config.layer_offloading and self.model_config.layer_offloading_transformer_percent > 0:
+                MemoryManager.attach(
+                    transformer,
+                    self.device_torch,
+                    offload_percent=self.model_config.layer_offloading_transformer_percent
+                )
             transformer.to(self.device_torch, dtype=dtype)
 
         flush()
@@ -129,6 +187,13 @@ class FluxKontextModel(BaseModel):
                 self.model_config.qtype))
             freeze(text_encoder_2)
             flush()
+        
+        if self.model_config.layer_offloading and self.model_config.layer_offloading_text_encoder_percent > 0:
+            MemoryManager.attach(
+                text_encoder_2,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_text_encoder_percent
+            )
 
         self.print_and_status_update("Loading CLIP")
         text_encoder = CLIPTextModel.from_pretrained(
@@ -136,6 +201,12 @@ class FluxKontextModel(BaseModel):
         tokenizer = CLIPTokenizer.from_pretrained(
             base_model_path, subfolder="tokenizer", torch_dtype=dtype)
         text_encoder.to(self.device_torch, dtype=dtype)
+        if self.model_config.layer_offloading and self.model_config.layer_offloading_text_encoder_percent > 0:
+            MemoryManager.attach(
+                text_encoder,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_text_encoder_percent
+            )
 
         self.print_and_status_update("Loading VAE")
         vae = AutoencoderKL.from_pretrained(
@@ -249,6 +320,14 @@ class FluxKontextModel(BaseModel):
         bypass_guidance_embedding: bool,
         **kwargs
     ):
+        def _ensure_device_dtype(t: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+            # Avoid unconditional .to(...) to reduce per-step allocations (helps low-VRAM stability).
+            if t.device != device:
+                t = t.to(device)
+            if t.dtype != dtype:
+                t = t.to(dtype=dtype)
+            return t
+
         with torch.no_grad():
             bs, c, h, w = latent_model_input.shape
             # if we have a control on the channel dimension, put it on the batch for packing
@@ -266,22 +345,12 @@ class FluxKontextModel(BaseModel):
                 ph=2,
                 pw=2
             )
-
-            img_ids = torch.zeros(h // 2, w // 2, 3)
-            img_ids[..., 1] = img_ids[..., 1] + torch.arange(h // 2)[:, None]
-            img_ids[..., 2] = img_ids[..., 2] + torch.arange(w // 2)[None, :]
-            img_ids = repeat(img_ids, "h w c -> b (h w) c",
-                             b=bs).to(self.device_torch)
-            
-            # handle control image ids
-            if has_control:
-                ctrl_ids = img_ids.clone()
-                ctrl_ids[..., 0] = 1
-                img_ids = torch.cat([img_ids, ctrl_ids], dim=1)
-                
-
-            txt_ids = torch.zeros(
-                bs, text_embeddings.text_embeds.shape[1], 3).to(self.device_torch)
+            img_ids = self._get_cached_img_ids(bs=bs, h=h, w=w, device=self.device_torch, has_control=has_control)
+            txt_ids = self._get_cached_txt_ids(
+                bs=bs,
+                seq_len=text_embeddings.text_embeds.shape[1],
+                device=self.device_torch
+            )
 
             # # handle guidance
             if self.unet_unwrapped.config.guidance_embeds:
@@ -315,14 +384,15 @@ class FluxKontextModel(BaseModel):
             )
             latent_size = latent.shape[1]
 
+        hidden_states = _ensure_device_dtype(latent_model_input_packed, self.device_torch, cast_dtype)
+        encoder_hidden_states = _ensure_device_dtype(text_embeddings.text_embeds, self.device_torch, cast_dtype)
+        pooled_projections = _ensure_device_dtype(text_embeddings.pooled_embeds, self.device_torch, cast_dtype)
+
         noise_pred = self.unet(
-            hidden_states=latent_model_input_packed.to(
-                self.device_torch, cast_dtype),
+            hidden_states=hidden_states,
             timestep=timestep / 1000,
-            encoder_hidden_states=text_embeddings.text_embeds.to(
-                self.device_torch, cast_dtype),
-            pooled_projections=text_embeddings.pooled_embeds.to(
-                self.device_torch, cast_dtype),
+            encoder_hidden_states=encoder_hidden_states,
+            pooled_projections=pooled_projections,
             txt_ids=txt_ids,
             img_ids=img_ids,
             guidance=guidance,
@@ -393,6 +463,14 @@ class FluxKontextModel(BaseModel):
     
     def condition_noisy_latents(self, latents: torch.Tensor, batch:'DataLoaderBatchDTO'):
         with torch.no_grad():
+            # Fast-path: if control latents were cached to disk (recommended for low VRAM),
+            # avoid VAE-encoding the control image during the training step.
+            control_latents = getattr(batch, "control_latents", None)
+            if control_latents is not None:
+                control_latent = control_latents.to(latents.device, latents.dtype)
+                latents = torch.cat((latents, control_latent), dim=1)
+                return latents.detach()
+
             control_tensor = batch.control_tensor
             if control_tensor is not None:
                 self.vae.to(self.device_torch)

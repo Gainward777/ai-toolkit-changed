@@ -17,6 +17,8 @@ config:
         type: "lora"
         linear: 16
         linear_alpha: 16
+        # Optional: dtype for LoRA weights (default float32). For low-VRAM you can try bf16/fp16.
+        # lora_weight_dtype: bf16
       save:
         dtype: float16 # precision to save
         save_every: 250 # save every this many steps
@@ -75,6 +77,9 @@ config:
         name_or_path: "black-forest-labs/FLUX.1-Kontext-dev"
         arch: "flux_kontext"
         quantize: true  # run 8bit mixed precision
+#        layer_offloading: true  # offload linear/conv layers dynamically to reduce VRAM (slower)
+#        layer_offloading_transformer_percent: 1.0
+#        layer_offloading_text_encoder_percent: 1.0
 #        low_vram: true  # uncomment this if the GPU is connected to your monitors. It will use less vram to quantize, but is slower.
       sample:
         sampler: "flowmatch" # must match train.noise_scheduler

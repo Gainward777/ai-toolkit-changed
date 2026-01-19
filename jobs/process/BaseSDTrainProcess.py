@@ -1746,8 +1746,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
 
 
-                # todo switch everything to proper mixed precision like this
-                self.network.force_to(self.device_torch, dtype=torch.float32)
+                # Keep LoRA/network weights in a configurable dtype (default fp32 for stability).
+                # For low-VRAM, setting network.lora_weight_dtype to bf16/fp16 can significantly reduce VRAM.
+                network_weight_dtype = get_torch_dtype(getattr(self.network_config, "lora_weight_dtype", "float32"))
+                self.network.force_to(self.device_torch, dtype=network_weight_dtype)
                 # give network to sd so it can use it
                 self.sd.network = self.network
                 self.network._update_torch_multiplier()

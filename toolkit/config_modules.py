@@ -211,6 +211,11 @@ class NetworkConfig:
         
         # ramtorch, doesn't work yet
         self.layer_offloading = kwargs.get('layer_offloading', False)
+        
+        # Dtype to keep the trainable network weights in (primarily affects LoRA/LoKR/etc).
+        # Default is fp32 for stability. For low-VRAM you may set "bf16" or "float16".
+        # Note: this is the dtype of the *network weights*, not the base model.
+        self.lora_weight_dtype: str = kwargs.get('lora_weight_dtype', 'float32')
 
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
@@ -947,6 +952,9 @@ class DatasetConfig:
         self.cache_latents: bool = kwargs.get('cache_latents', False)
         # cache latents to disk will store them on disk. If both are true, it will save to disk, but keep in memory
         self.cache_latents_to_disk: bool = kwargs.get('cache_latents_to_disk', False)
+        # By default we forbid latent caching for multi-frame datasets (safety/consistency).
+        # Set to false only if you fully understand the implications and have a compatible pipeline.
+        self.forbid_cache_latents_multi_frame: bool = kwargs.get('forbid_cache_latents_multi_frame', True)
         self.cache_clip_vision_to_disk: bool = kwargs.get('cache_clip_vision_to_disk', False)
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
 
