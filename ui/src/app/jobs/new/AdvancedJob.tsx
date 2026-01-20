@@ -80,6 +80,9 @@ export default function AdvancedJob({ jobConfig, setJobConfig, settings }: Props
 
         // Only update if the content is actually different
         if (yamlContent !== editor.getValue()) {
+          // Keep React state in sync with editor to avoid "snap back" behavior.
+          setEditorValue(yamlContent);
+
           // Set value directly on the editor model instead of using React state
           editor.getModel()?.setValue(yamlContent);
 
@@ -100,24 +103,31 @@ export default function AdvancedJob({ jobConfig, setJobConfig, settings }: Props
     if (value === undefined) return;
 
     try {
+      // Keep the editor controlled (otherwise the wrapper can re-apply the old prop value).
+      setEditorValue(value);
+
       const parsed = YAML.parse(value);
+
+      // We have to ensure certain things are always set (and do it BEFORE we compare/update refs).
+      try {
+        parsed.config.process[0].sqlite_db_path = './aitk_db.db';
+        parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
+        parsed.config.process[0].device = 'cuda';
+        parsed.config.process[0].performance_log_every = 10;
+      } catch (e) {
+        console.warn(e);
+      }
+
+      // Make sure migrations are applied; it may mutate and/or return an updated object.
+      const migrated = migrateJobConfig(parsed) as any;
+      const normalized = migrated ?? parsed;
+
       // Don't update jobConfig if the change came from the editor itself
       // to avoid a circular update loop
-      if (JSON.stringify(parsed) !== lastJobConfigUpdateStringRef.current) {
-        lastJobConfigUpdateStringRef.current = JSON.stringify(parsed);
-
-        // We have to ensure certain things are always set
-        try {
-          // parsed.config.process[0].type = 'ui_trainer';
-          parsed.config.process[0].sqlite_db_path = './aitk_db.db';
-          parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
-          parsed.config.process[0].device = 'cuda';
-          parsed.config.process[0].performance_log_every = 10;
-        } catch (e) {
-          console.warn(e);
-        }
-        migrateJobConfig(parsed);
-        setJobConfig(parsed);
+      const normalizedString = JSON.stringify(normalized);
+      if (normalizedString !== lastJobConfigUpdateStringRef.current) {
+        lastJobConfigUpdateStringRef.current = normalizedString;
+        setJobConfig(normalized);
       }
     } catch (e) {
       // Don't update on parsing errors
