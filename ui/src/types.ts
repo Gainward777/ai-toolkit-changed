@@ -67,6 +67,7 @@ export interface NetworkConfig {
   conv_alpha: number;
   lokr_full_rank: boolean;
   lokr_factor: number;
+  lora_weight_dtype?: string;
   network_kwargs: {
     ignore_if_contains: string[];
   };
@@ -91,6 +92,7 @@ export interface DatasetConfig {
   is_reg: boolean;
   network_weight: number;
   cache_latents_to_disk?: boolean;
+  forbid_cache_latents_multi_frame?: boolean;
   resolution: number[];
   controls: string[];
   control_path?: string | null;
