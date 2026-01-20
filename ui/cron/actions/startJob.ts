@@ -49,6 +49,25 @@ const startAndWatchJob = (job: Job) => {
     const jobConfig = JSON.parse(job.job_config);
     jobConfig.config.process[0].sqlite_db_path = path.join(TOOLKIT_ROOT, 'aitk_db.db');
 
+    // Ensure optimization-related fields are always present in the on-disk config,
+    // even if the DB-stored job_config predates these fields.
+    try {
+      const p0 = jobConfig?.config?.process?.[0];
+      if (p0?.network && p0.network.lora_weight_dtype === undefined) {
+        p0.network.lora_weight_dtype = 'float32';
+      }
+      if (Array.isArray(p0?.datasets)) {
+        for (const ds of p0.datasets) {
+          if (!ds) continue;
+          if (ds.forbid_cache_latents_multi_frame === undefined) {
+            ds.forbid_cache_latents_multi_frame = true;
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Error normalizing job config defaults:', e);
+    }
+
     // write the config file
     fs.writeFileSync(configPath, JSON.stringify(jobConfig, null, 2));
 
