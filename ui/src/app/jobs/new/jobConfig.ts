@@ -8,6 +8,7 @@ export const defaultDatasetConfig: DatasetConfig = {
   caption_ext: 'txt',
   caption_dropout_rate: 0.05,
   cache_latents_to_disk: false,
+  forbid_cache_latents_multi_frame: true,
   is_reg: false,
   network_weight: 1,
   resolution: [512, 768, 1024],
@@ -48,6 +49,7 @@ export const defaultJobConfig: JobConfig = {
           conv_alpha: 16,
           lokr_full_rank: true,
           lokr_factor: -1,
+          lora_weight_dtype: 'float32',
           network_kwargs: {
             ignore_if_contains: [],
           },
@@ -186,6 +188,29 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
     jobConfig.config.process[0].model.layer_offloading = (jobConfig.config.process[0].model.auto_memory ||
       false) as boolean;
     delete jobConfig.config.process[0].model.auto_memory;
+  }
+
+  // Ensure new optimization-related fields are always present (prevents them being lost when the
+  // UI/runner regenerates the on-disk config).
+  if (jobConfig?.config?.process?.[0]) {
+    const p0: any = jobConfig.config.process[0];
+
+    // Network: LoRA dtype
+    if (p0.network) {
+      if (p0.network.lora_weight_dtype === undefined) {
+        p0.network.lora_weight_dtype = 'float32';
+      }
+    }
+
+    // Datasets: forbid latent caching on multi-frame datasets (safe default)
+    if (Array.isArray(p0.datasets)) {
+      for (const ds of p0.datasets) {
+        if (!ds) continue;
+        if (ds.forbid_cache_latents_multi_frame === undefined) {
+          ds.forbid_cache_latents_multi_frame = true;
+        }
+      }
+    }
   }
   return jobConfig;
 };
