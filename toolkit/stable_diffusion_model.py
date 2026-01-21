@@ -2514,10 +2514,31 @@ class StableDiffusion:
         if dtype is None:
             dtype = self.vae_torch_dtype
 
+        # Debug logging (one-time): helps diagnose "VAE encode on CPU vs GPU" issues.
+        # Low-noise: prints only once per process.
+        if not hasattr(self, "_debug_logged_encode_images"):
+            try:
+                self._debug_logged_encode_images = True
+                vae_param = next(self.vae.parameters(), None)
+                vae_param_dtype = getattr(vae_param, "dtype", "unknown")
+                print_acc(
+                    f"[encode_images] target_device={device} target_dtype={dtype} "
+                    f"vae_device(before)={getattr(self.vae, 'device', 'unknown')} "
+                    f"vae_param_dtype={vae_param_dtype}"
+                )
+            except Exception:
+                self._debug_logged_encode_images = True
+
         latent_list = []
         # Move to vae to device if on cpu
         if self.vae.device == torch.device("cpu"):
             self.vae.to(device)
+            if not hasattr(self, "_debug_logged_encode_images_move"):
+                try:
+                    self._debug_logged_encode_images_move = True
+                    print_acc(f"[encode_images] moved VAE from CPU to {device}")
+                except Exception:
+                    self._debug_logged_encode_images_move = True
         self.vae.eval()
         self.vae.requires_grad_(False)
         # move to device and dtype
