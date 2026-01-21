@@ -466,6 +466,18 @@ class FluxKontextModel(BaseModel):
             # Fast-path: if control latents were cached to disk (recommended for low VRAM),
             # avoid VAE-encoding the control image during the training step.
             control_latents = getattr(batch, "control_latents", None)
+            if not hasattr(self, "_debug_logged_kontext_condition"):
+                try:
+                    self._debug_logged_kontext_condition = True
+                    ctrl_tensor = getattr(batch, "control_tensor", None)
+                    print(
+                        f"[flux_kontext] condition_noisy_latents: "
+                        f"latents={tuple(latents.shape)} device={latents.device} dtype={latents.dtype} "
+                        f"has_control_latents={control_latents is not None} "
+                        f"has_control_tensor={ctrl_tensor is not None}"
+                    )
+                except Exception:
+                    self._debug_logged_kontext_condition = True
             if control_latents is not None:
                 control_latent = control_latents.to(latents.device, latents.dtype)
                 latents = torch.cat((latents, control_latent), dim=1)
