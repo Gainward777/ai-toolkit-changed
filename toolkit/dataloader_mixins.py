@@ -1748,9 +1748,34 @@ class LatentCachingMixin:
             # move sd items to cpu except for vae
             self.sd.set_device_state_preset('cache_latents')
 
+            # Debug info (printed once per caching run): helps detect CPU/GPU placement.
+            try:
+                total = len(self.file_list)
+                print_acc(
+                    f"[latent-cache] total_items={total} to_disk={to_disk} to_memory={to_memory} "
+                    f"sd_device={getattr(self.sd, 'device', 'unknown')} "
+                    f"sd_device_torch={getattr(self.sd, 'device_torch', 'unknown')} "
+                    f"vae_device_torch={getattr(self.sd, 'vae_device_torch', 'unknown')} "
+                    f"vae_device(current)={getattr(getattr(self.sd, 'vae', None), 'device', 'unknown')} "
+                    f"torch_dtype={getattr(self.sd, 'torch_dtype', 'unknown')}"
+                )
+            except Exception:
+                pass
+
             # use tqdm to show progress
             i = 0
             for file_item in tqdm(self.file_list, desc=f'Caching latents{" to disk" if to_disk else ""}'):
+                # lightweight progress log every 50 items (tqdm is great, but logs help when users only see "step=0")
+                if i % 50 == 0:
+                    try:
+                        print_acc(
+                            f"[latent-cache] progress {i}/{len(self.file_list)} "
+                            f"vae_device={getattr(getattr(self.sd, 'vae', None), 'device', 'unknown')} "
+                            f"vae_device_torch={getattr(self.sd, 'vae_device_torch', 'unknown')}"
+                        )
+                    except Exception:
+                        pass
+
                 # set latent space version
                 if self.sd.model_config.latent_space_version is not None:
                     file_item.latent_space_version = self.sd.model_config.latent_space_version
@@ -1788,6 +1813,12 @@ class LatentCachingMixin:
                     # add batch dimension
                     try:
                         imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
+                        if i == 0:
+                            # first-item debug to confirm tensor device path
+                            print_acc(
+                                f"[latent-cache] first encode: imgs.device={imgs.device} imgs.dtype={imgs.dtype} "
+                                f"vae_device(before)={getattr(getattr(self.sd, 'vae', None), 'device', 'unknown')}"
+                            )
                         latent = self.sd.encode_images(imgs).squeeze(0)
                     except Exception as e:
                         print_acc(f"Error processing image: {file_item.path}")
@@ -1812,6 +1843,11 @@ class LatentCachingMixin:
                                 if ctrl.shape[-2] != target_h or ctrl.shape[-1] != target_w:
                                     ctrl = F.interpolate(ctrl, size=(target_h, target_w), mode='bilinear')
                                 ctrl = ctrl.to(self.sd.vae_device_torch, dtype=self.sd.torch_dtype)
+                                if i == 0:
+                                    print_acc(
+                                        f"[latent-cache] first control encode: ctrl.device={ctrl.device} ctrl.dtype={ctrl.dtype} "
+                                        f"vae_device(before)={getattr(getattr(self.sd, 'vae', None), 'device', 'unknown')}"
+                                    )
                                 control_latent = self.sd.encode_images(ctrl).squeeze(0).to(latent.device, latent.dtype)
                         except Exception as e:
                             print_acc(f"Error processing control image for: {file_item.path}")
