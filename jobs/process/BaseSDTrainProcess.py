@@ -2006,14 +2006,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
-            self.sample(0, is_first=True)
+            with self.timer('sample:first'):
+                self.sample(0, is_first=True)
 
         # sample first
         if self.train_config.skip_first_sample or self.train_config.disable_sampling:
             print_acc("Skipping first sample due to config setting")
         elif self.step_num <= 1 or self.train_config.force_first_sample:
             print_acc("Generating baseline samples before training")
-            self.sample(self.step_num)
+            with self.timer('sample:baseline'):
+                self.sample(self.step_num)
         
         if self.accelerator.is_local_main_process:
             self.progress_bar = ToolkitProgressBar(
@@ -2160,8 +2162,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             did_oom = False
             loss_dict = None
             try:
-                with self.accelerator.accumulate(self.modules_being_trained):
-                    loss_dict = self.hook_train_loop(batch_list)
+                with self.timer('hook_train_loop'):
+                    with self.accelerator.accumulate(self.modules_being_trained):
+                        loss_dict = self.hook_train_loop(batch_list)
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
@@ -2239,7 +2242,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
                         print_acc(f"\nSaving at step {self.step_num}")
-                        self.save(self.step_num)
+                        with self.timer('save'):
+                            self.save(self.step_num)
                         self.ensure_params_requires_grad()
                         # clear any grads
                         optimizer.zero_grad()
@@ -2255,7 +2259,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         # print above the progress bar
                         if self.train_config.free_u:
                             self.sd.pipeline.disable_freeu()
-                        self.sample(self.step_num)
+                        with self.timer('sample:step'):
+                            self.sample(self.step_num)
                         if self.train_config.unload_text_encoder:
                             # make sure the text encoder is unloaded
                             self.sd.text_encoder_to('cpu')
