@@ -43,21 +43,19 @@ class Timer:
         self._after_print_hooks.append(hook)
 
     def print(self):
-        if not is_ui:
-            print(f"\nTimer '{self.name}':")
+        # Print timings even in UI mode so users can see breakdown in logs.
+        print(f"\nTimer '{self.name}':")
         timing_dict = {}
         # sort by longest at top
         for timer_name, timings in sorted(self.timers.items(), key=lambda x: sum(x[1]), reverse=True):
             avg_time = sum(timings) / len(timings)
-            
-            if not is_ui:
-                print(f" - {avg_time:.4f}s avg - {timer_name}, num = {len(timings)}")
+
+            print(f" - {avg_time:.4f}s avg - {timer_name}, num = {len(timings)}")
             timing_dict[timer_name] = avg_time
 
         for hook in self._after_print_hooks:
             hook(timing_dict)
-        if not is_ui:
-            print('')
+        print('')
 
     def reset(self):
         self.timers.clear()

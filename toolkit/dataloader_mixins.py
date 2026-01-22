@@ -40,6 +40,13 @@ if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import FileItemDTO
     from toolkit.stable_diffusion_model import StableDiffusion
 
+# Latent disk read profiling (main-process friendly; used by FileItemDTO.get_latent()).
+_LATENT_DISK_READ_COUNT = 0
+_LATENT_DISK_READ_SECONDS_TOTAL = 0.0
+_LATENT_DISK_READ_SECONDS_MAX = 0.0
+_LATENT_DISK_READ_WITH_CONTROL_COUNT = 0
+_LATENT_DISK_READ_LOG_EVERY = 2
+
 accelerator = get_accelerator()
 
 # def get_associated_caption_from_img_path(img_path):
@@ -1709,15 +1716,33 @@ class LatentCachingFileItemDTOMixin:
         if not self.is_latent_cached:
             return None
         if self._encoded_latent is None:
-            # load it from disk
-            state_dict = load_file(
-                self.get_latent_path(),
-                # device=device if device is not None else self.latent_load_device
-                device='cpu'
-            )
+            # load it from disk (profile time; impacts get_batch latency when caching latents to disk)
+            global _LATENT_DISK_READ_COUNT, _LATENT_DISK_READ_SECONDS_TOTAL, _LATENT_DISK_READ_SECONDS_MAX, _LATENT_DISK_READ_WITH_CONTROL_COUNT
+            t0 = time.perf_counter()
+            latent_path = self.get_latent_path()
+            state_dict = load_file(latent_path, device='cpu')
+            dt = time.perf_counter() - t0
+            _LATENT_DISK_READ_COUNT += 1
+            _LATENT_DISK_READ_SECONDS_TOTAL += dt
+            if dt > _LATENT_DISK_READ_SECONDS_MAX:
+                _LATENT_DISK_READ_SECONDS_MAX = dt
             self._encoded_latent = state_dict['latent']
             if 'control_latent' in state_dict:
                 self._cached_control_latent = state_dict['control_latent']
+                _LATENT_DISK_READ_WITH_CONTROL_COUNT += 1
+
+            # periodic aggregate logging (kept low-noise)
+            if _LATENT_DISK_READ_COUNT % _LATENT_DISK_READ_LOG_EVERY == 0:
+                try:
+                    avg_ms = (_LATENT_DISK_READ_SECONDS_TOTAL / max(_LATENT_DISK_READ_COUNT, 1)) * 1000.0
+                    max_ms = _LATENT_DISK_READ_SECONDS_MAX * 1000.0
+                    print_acc(
+                        f"[latent-io] loaded={_LATENT_DISK_READ_COUNT} avg_ms={avg_ms:.2f} max_ms={max_ms:.2f} "
+                        f"with_control={_LATENT_DISK_READ_WITH_CONTROL_COUNT} last_ms={dt*1000.0:.2f} "
+                        f"last_file={os.path.basename(latent_path)}"
+                    )
+                except Exception:
+                    pass
         return self._encoded_latent
 
 
