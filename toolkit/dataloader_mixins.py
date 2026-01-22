@@ -5,10 +5,10 @@ import json
 import math
 import os
 import random
+import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, List, Dict, Union
 import traceback
-import time
 
 import cv2
 import numpy as np
@@ -35,6 +35,7 @@ from toolkit.prompt_utils import PromptEmbeds
 from torchvision.transforms import functional as TF
 
 from toolkit.train_tools import get_torch_dtype
+from torch.utils.data import get_worker_info
 
 if TYPE_CHECKING:
     from toolkit.data_loader import AiToolkitDataset
@@ -1737,8 +1738,14 @@ class LatentCachingFileItemDTOMixin:
                 try:
                     avg_ms = (_LATENT_DISK_READ_SECONDS_TOTAL / max(_LATENT_DISK_READ_COUNT, 1)) * 1000.0
                     max_ms = _LATENT_DISK_READ_SECONDS_MAX * 1000.0
+                    wi = get_worker_info()
+                    # When num_workers > 0, each worker is a separate process with its own counters.
+                    # To avoid log spam and to make it easier to interpret, only log from worker 0.
+                    if wi is not None and wi.id != 0:
+                        return self._encoded_latent
                     print_acc(
-                        f"[latent-io] loaded={_LATENT_DISK_READ_COUNT} avg_ms={avg_ms:.2f} max_ms={max_ms:.2f} "
+                        f"[latent-io] worker={wi.id if wi is not None else 'main'} pid={os.getpid()} "
+                        f"loaded={_LATENT_DISK_READ_COUNT} avg_ms={avg_ms:.2f} max_ms={max_ms:.2f} "
                         f"with_control={_LATENT_DISK_READ_WITH_CONTROL_COUNT} last_ms={dt*1000.0:.2f} "
                         f"last_file={os.path.basename(latent_path)}"
                     )
