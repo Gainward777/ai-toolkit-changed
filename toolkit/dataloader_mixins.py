@@ -47,7 +47,9 @@ _LATENT_DISK_READ_COUNT = 0
 _LATENT_DISK_READ_SECONDS_TOTAL = 0.0
 _LATENT_DISK_READ_SECONDS_MAX = 0.0
 _LATENT_DISK_READ_WITH_CONTROL_COUNT = 0
-_LATENT_DISK_READ_LOG_EVERY = 2
+# Keep this low-noise by default; override with env var when debugging.
+# Example: AITK_LATENT_IO_LOG_EVERY=2 for very verbose logs.
+_LATENT_DISK_READ_LOG_EVERY = int(os.environ.get("AITK_LATENT_IO_LOG_EVERY", "50"))
 
 accelerator = get_accelerator()
 
