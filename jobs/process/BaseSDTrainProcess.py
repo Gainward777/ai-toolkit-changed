@@ -1049,14 +1049,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 is_reg = any(batch.get_is_reg_list())
                 if batch.tensor is not None:
                     imgs = batch.tensor
-                    imgs = imgs.to(self.device_torch, dtype=dtype)
+                    with self.timer('to_device:imgs'):
+                        imgs = imgs.to(self.device_torch, dtype=dtype)
                     # dont adjust for regs.
                     if self.train_config.img_multiplier is not None and not is_reg:
                         # do it ad contrast
                         imgs = reduce_contrast(imgs, self.train_config.img_multiplier)
                 if batch.latents is not None:
-                    latents = batch.latents.to(self.device_torch, dtype=dtype)
+                    # When latents are cached to disk, DataLoader yields CPU tensors and we pay CPU->GPU copy here.
+                    latents_cpu = batch.latents
+                    with self.timer('to_device:latents'):
+                        latents = latents_cpu.to(self.device_torch, dtype=dtype)
                     batch.latents = latents
+                    try:
+                        del latents_cpu
+                    except Exception:
+                        pass
                 else:
                     # normalize to
                     if self.train_config.standardize_images:
@@ -1084,6 +1092,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                     latents = self.sd.encode_images(imgs)
                     batch.latents = latents
+
+                # Optional: if control latents were cached alongside normal latents (e.g. Flux-Kontext),
+                # move them to the training device here to avoid per-step device work later.
+                if hasattr(batch, "control_latents") and getattr(batch, "control_latents", None) is not None:
+                    ctrl_cpu = batch.control_latents
+                    with self.timer('to_device:control_latents'):
+                        batch.control_latents = ctrl_cpu.to(self.device_torch, dtype=dtype)
+                    try:
+                        del ctrl_cpu
+                    except Exception:
+                        pass
 
                 if self.train_config.standardize_latents:
                     if self.sd.is_xl or self.sd.is_vega or self.sd.is_ssd:
