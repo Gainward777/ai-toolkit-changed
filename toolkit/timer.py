@@ -13,6 +13,9 @@ class Timer:
         self.timers = OrderedDict()
         self.active_timers = {}
         self.current_timer = None  # Used for the context manager functionality
+        # Support nested `with timer('x'):` by tracking a stack of active context timers.
+        # Without this, nested timers overwrite `current_timer` and break on __exit__.
+        self._timer_stack = []
         self._after_print_hooks = []
 
     def start(self, timer_name):
@@ -60,9 +63,11 @@ class Timer:
     def reset(self):
         self.timers.clear()
         self.active_timers.clear()
+        self._timer_stack.clear()
 
     def __call__(self, timer_name):
         """Enable the use of the Timer class as a context manager."""
+        self._timer_stack.append(timer_name)
         self.current_timer = timer_name
         self.start(timer_name)
         return self
@@ -71,9 +76,12 @@ class Timer:
         pass
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # Restore previous timer context (nested timers are common in training loop).
+        timer_name = self._timer_stack.pop() if self._timer_stack else self.current_timer
         if exc_type is None:
             # No exceptions, stop the timer normally
-            self.stop(self.current_timer)
+            self.stop(timer_name)
         else:
             # There was an exception, cancel the timer
-            self.cancel(self.current_timer)
+            self.cancel(timer_name)
+        self.current_timer = self._timer_stack[-1] if self._timer_stack else None
