@@ -6,11 +6,15 @@ from typing import Union, Literal, List, Optional
 import numpy as np
 from diffusers import T2IAdapter, AutoencoderTiny, ControlNetModel
 
-import torch.functional as F
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader, ConcatDataset
 from toolkit.util.texture_losses import SpectralPeriodLoss, LogPolarAlignLoss, ScaleConsistencyLoss, ACFPeriodLoss
 from toolkit.util.local_texture import LocalTextureRegularityLoss
+from toolkit.util.tiling_losses_advanced import (
+    SeamlessLoss, GradientPeriodLoss, CrossPatchConsistencyLoss, 
+    MultiScaleSpectralLoss, AdvancedTilingLoss, LatentPeriodLoss,
+    GlobalPeriodAnchorLoss
+)
 from toolkit.util.phase_correlation_loss import PhaseCorrelationLoss
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
@@ -68,6 +72,8 @@ class SDTrainer(BaseSDTrainProcess):
             patch_size= self.train_config.local_patch_size,
             stride=self.train_config.local_stride,
             min_coverage=self.train_config.local_min_coverage,
+            hard_k_frac=getattr(self.train_config, 'local_hard_k_frac', 0.30),  # fraction of worst patches to use
+            hard_k_min=getattr(self.train_config, 'local_hard_k_min', 4),  # minimum number of patches
             w_spectral=self.train_config.local_w_spectral, 
             w_afc=self.train_config.local_w_afc,       
             w_phase=self.train_config.local_w_phase,     
@@ -118,6 +124,47 @@ class SDTrainer(BaseSDTrainProcess):
         )
         self.scale_consistency_loss = ScaleConsistencyLoss(
              r_bins=256, tau=0.06, min_bin=2, max_bin=None, w=1.0
+        )
+        
+        # Advanced tiling losses (scientific improvements)
+        self.seamless_loss = SeamlessLoss(
+            edge_width=getattr(self.train_config, 'seamless_edge_width', 16),
+            use_gradient=getattr(self.train_config, 'seamless_use_gradient', True),
+            multi_scale=getattr(self.train_config, 'seamless_multi_scale', True),
+            check_diagonals=getattr(self.train_config, 'seamless_check_diagonals', True),
+            diagonal_weight=getattr(self.train_config, 'seamless_diagonal_weight', 0.5),
+            w=1.0,
+        )
+        self.gradient_period_loss = GradientPeriodLoss(
+            r_bins=self.train_config.r_bins,
+            tau=self.train_config.tau,
+            band_sigma=self.train_config.band_sigma,
+            w=1.0,
+        )
+        self.cross_patch_loss = CrossPatchConsistencyLoss(
+            patch_size=getattr(self.train_config, 'cross_patch_size', 128),
+            stride=getattr(self.train_config, 'cross_patch_stride', 64),
+            r_bins=64,
+            tau=0.08,
+            w=1.0,
+        )
+        self.global_period_anchor_loss = GlobalPeriodAnchorLoss(
+            patch_size=getattr(self.train_config, 'anchor_patch_size', 128),
+            stride=getattr(self.train_config, 'anchor_stride', 64),
+            r_bins=128,
+            tau=0.06,
+            w=1.0,
+        )
+        self.multiscale_loss = MultiScaleSpectralLoss(
+            scales=getattr(self.train_config, 'multiscale_scales', [1.0, 0.5, 0.25]),
+            r_bins=self.train_config.r_bins,
+            tau=self.train_config.tau,
+            w=1.0,
+        )
+        self.latent_period_loss = LatentPeriodLoss(
+            r_bins=64,  # lower resolution for latents
+            tau=0.08,
+            w=1.0,
         )
 
         self._clip_image_embeds_unconditional: Union[List[str], None] = None
@@ -193,6 +240,7 @@ class SDTrainer(BaseSDTrainProcess):
                     prompt=prompt, # it will autoparse the prompt
                     negative_prompt=sample_item.neg,
                     output_path=output_path,
+                    adapter_image_path=getattr(sample_item, 'adapter_image_path', None),
                     ctrl_img=sample_item.ctrl_img,
                     ctrl_img_1=sample_item.ctrl_img_1,
                     ctrl_img_2=sample_item.ctrl_img_2,
@@ -876,10 +924,8 @@ class SDTrainer(BaseSDTrainProcess):
                 # the way this loss works, it is low, increase it to match predictable LR effects
                 loss = loss * 10.0
             elif self.train_config.loss_type == "mse_l1":
-                print("In mse_l1")
                 loss = mse_l1_loss(pred.float(), target.float())
             else:
-                print("default")
                 loss = torch.nn.functional.mse_loss(pred.float(), target.float(), reduction="none")
                 
             do_weighted_timesteps = False
@@ -986,137 +1032,180 @@ class SDTrainer(BaseSDTrainProcess):
                 "local"
             )
         ):
+            step = self.current_step
+            warmup_steps = self.train_config.steps
+            
+            # === EARLY EXIT: вычисляем gate ДО VAE decode ===
+            t01_flat = (timesteps.float() / float(self.sd.noise_scheduler.config.num_train_timesteps)).clamp(0, 1)
+            if t01_flat.dim() > 1:
+                t01_flat = t01_flat.view(-1)
+            
+            gate = (1.0 - t01_flat)  # 1 когда t малый (чистое изображение)
+            gate = ((gate - self.train_config.gate) / (1.0 - self.train_config.gate)).clamp(0, 1)
+            gate_mean = gate.mean()
+            gate_mean_val = gate_mean.item()  # для проверок
+            
+            # Warmup beta
+            beta = min(1.0, float(step) / float(warmup_steps))
+            final_beta = self.train_config.min_beta + beta * (self.train_config.max_beta - self.train_config.min_beta)
+            
+            # Skip expensive VAE decode if texture loss would be ~0
+            if gate_mean_val < 0.01 or final_beta < 0.01:
+                return loss
+            
+            # === VAE DECODE (только если нужен texture loss) ===
             vae = self.sd.vae
             scaling_factor = vae.config.get("scaling_factor", 1.0)
 
-            tgt_latents_vae = batch.latents.to(vae.device, dtype=vae.dtype)
+            vae.eval()
+            vae.to(self.device_torch)
 
-            alpha = 0.1
+            tgt_latents_vae = batch.latents.to(self.device_torch, dtype=vae.dtype)
+            c_vae = tgt_latents_vae.shape[1]
 
-            step = self.current_step
-            warmup_steps = 2000
+            t01 = t01_flat.view(-1, 1, 1, 1).to(noisy_latents.device, dtype=noisy_latents.dtype)
 
-            latents_for_pred = batch.latents.to(
-                noise_pred.device, dtype=noise_pred.dtype
-            )
-            c_lat = latents_for_pred.shape[1]
-            c_pred = noise_pred.shape[1]
+            x_t = noisy_latents[:, :c_vae, :, :]
 
-            if c_pred == c_lat:
-                proj = noise_pred
-            elif c_pred > c_lat:
-                proj = noise_pred[:, :c_lat, :, :]
+            model_out = noise_pred
+            if model_out.shape[1] >= c_vae:
+                v = model_out[:, :c_vae, :, :]
             else:
-                pad_ch = c_lat - c_pred
-                pad = torch.zeros(
-                    noise_pred.shape[0],
-                    pad_ch,
-                    noise_pred.shape[2],
-                    noise_pred.shape[3],
-                    device=noise_pred.device,
-                    dtype=noise_pred.dtype,
+                pad_ch = c_vae - model_out.shape[1]
+                v = torch.cat(
+                    [model_out, torch.zeros(model_out.shape[0], pad_ch, model_out.shape[2], model_out.shape[3],
+                                            device=model_out.device, dtype=model_out.dtype)],
+                    dim=1
                 )
-                proj = torch.cat([noise_pred, pad], dim=1)
 
-            pred_latents_vae = (latents_for_pred + alpha * proj).to(
-                vae.device, dtype=vae.dtype 
-            )
-            if self.train_config.is_Qwen:
-                print("Qwen")
-                if pred_latents_vae.ndim == 4:
-                    pred_latents_vae = pred_latents_vae.unsqueeze(2)  # (B,C,1,H,W)
-                if tgt_latents_vae.ndim == 4:
-                    tgt_latents_vae = tgt_latents_vae.unsqueeze(2)    # (B,C,1,H,W)
+            # rectified flow: x1 = x_t + (1-t)*v
+            v_scale = self.train_config.v_scale
+            pred_x0_latents_tex = (x_t - t01 * (v_scale * v)).to(self.device_torch, dtype=vae.dtype)
 
-            pred_imgs = vae.decode(pred_latents_vae / scaling_factor).sample
-            tgt_imgs = vae.decode(tgt_latents_vae / scaling_factor).sample
+            pred_imgs = vae.decode(pred_x0_latents_tex / scaling_factor).sample.float()
+            tgt_imgs  = vae.decode(tgt_latents_vae     / scaling_factor).sample.float()
 
             if self.train_config.is_Qwen:
-                print("Qwen_2")
                 if pred_imgs.ndim == 5 and pred_imgs.shape[2] == 1:
                     pred_imgs = pred_imgs[:, :, 0]
                 if tgt_imgs.ndim == 5 and tgt_imgs.shape[2] == 1:
                     tgt_imgs = tgt_imgs[:, :, 0]
 
-            # <<< ВАЖНО: перевести в float32 для FFT >>>
             pred_imgs = pred_imgs.float()
-            tgt_imgs = tgt_imgs.float()
+            tgt_imgs  = tgt_imgs.float()
 
-            if batch.mask_tensor is not None and len(pred_imgs.shape) == 4:
-                print('mask_full')
-                mask_img = batch.mask_tensor.to(
-                    vae.device, dtype=pred_imgs.dtype
-                )
+            # --- MASK: resize nearest + clamp/binarize ---
+            if batch.mask_tensor is not None and pred_imgs.ndim == 4:
+                mask_img = batch.mask_tensor.to(self.device_torch, dtype=torch.float32)
                 mask_img = torch.nn.functional.interpolate(
                     mask_img,
                     size=pred_imgs.shape[-2:],
-                    mode="bicubic",
-                    align_corners=False,
+                    mode="nearest",
                 )
+                mask_img = mask_img.clamp(0, 1)
+                mask_img = (mask_img > 0.5).float()
             else:
-                if len(pred_imgs.shape) == 4:
-                    print('mask_one')
+                if pred_imgs.ndim == 4:
                     mask_img = torch.ones(
                         pred_imgs.shape[0],
                         1,
                         pred_imgs.shape[2],
                         pred_imgs.shape[3],
-                        device=vae.device,
-                        dtype=pred_imgs.dtype,
+                        device=self.device_torch,
+                        dtype=torch.float32,
                     )
                 else:
                     mask_img = None
 
-
-            
             if mask_img is not None:
+                # gate_mean и final_beta уже вычислены выше (до VAE decode)
                 mask_img = mask_img.float()
-                beta = min(1.0, float(step) / float(warmup_steps))
-                final_beta = self.train_config.min_beta + beta * (self.train_config.max_beta - self.train_config.min_beta)
+
+                additional_loss = torch.zeros((), device=loss.device, dtype=loss.dtype)
                 if self.train_config.texture_loss == "custom":
-                    print("custom with coef")
-                    tex_sp = self.spectral_period_loss(pred_imgs, tgt_imgs, mask_img)
-                    tex_lp = self.logpolar_loss(pred_imgs, tgt_imgs, mask_img)
-                    tex_acf = self.acf_period_loss(pred_imgs, tgt_imgs, mask_img)
-                    tex_ph = self.phase_loss(pred_imgs, tgt_imgs, mask_img)
-                    additional_loss = additional_loss + (self.train_config.loss_Spect_coef * tex_sp + self.train_config.loss_Log_coef * tex_lp + self.train_config.loss_AFC_coef * tex_acf + self.train_config.loss_Phase_coef * tex_ph)
-                    if step % 50 == 0:  # лог
-                        diag = self.phase_loss.diagnostics(pred_imgs, tgt_imgs, mask_img)
-                        print(
-                            f"[step {step}] PCL diag: "
-                            f"center_prob={diag['center_prob']:.3f}  PCE={diag['PCE']:.2f}"
-                        )
+                    # === LAZY EVALUATION: вычисляем только нужные лоссы ===
+                    
+                    # Local loss (основной)
+                    if self.train_config.loss_local_coef > 0:
+                        tex_local = self.local_texture_loss(pred_imgs, tgt_imgs, mask_img)
+                        additional_loss = additional_loss + self.train_config.loss_local_coef * tex_local
+                    
+                    # Spectral loss
+                    if self.train_config.loss_Spect_coef > 0:
+                        ft = self.spectral_period_loss.get_peak_center(tgt_imgs, mask_img)
+                        tex_sp = self.spectral_period_loss(pred_imgs, tgt_imgs, mask_img, center_override=ft)
+                        additional_loss = additional_loss + self.train_config.loss_Spect_coef * tex_sp
+                    
+                    # Log-polar loss
+                    if self.train_config.loss_Log_coef > 0:
+                        tex_lp = self.logpolar_loss(pred_imgs, tgt_imgs, mask_img)
+                        additional_loss = additional_loss + self.train_config.loss_Log_coef * tex_lp
+                    
+                    # ACF loss
+                    if self.train_config.loss_AFC_coef > 0:
+                        tex_acf = self.acf_period_loss(pred_imgs, tgt_imgs, mask_img)
+                        additional_loss = additional_loss + self.train_config.loss_AFC_coef * tex_acf
+                    
+                    # Phase loss
+                    if self.train_config.loss_Phase_coef > 0:
+                        tex_ph = self.phase_loss(pred_imgs, tgt_imgs, mask_img)
+                        additional_loss = additional_loss + self.train_config.loss_Phase_coef * tex_ph
+                    
+                    # === Advanced losses (только если coef > 0) ===
+                    if getattr(self.train_config, 'loss_seamless_coef', 0.0) > 0:
+                        tex_seamless = self.seamless_loss(pred_imgs, tgt_imgs, mask_img)
+                        additional_loss = additional_loss + self.train_config.loss_seamless_coef * tex_seamless
+                    
+                    if getattr(self.train_config, 'loss_gradient_coef', 0.0) > 0:
+                        tex_gradient = self.gradient_period_loss(pred_imgs, tgt_imgs, mask_img)
+                        additional_loss = additional_loss + self.train_config.loss_gradient_coef * tex_gradient
+                    
+                    if getattr(self.train_config, 'loss_cross_patch_coef', 0.0) > 0:
+                        tex_cross_patch = self.cross_patch_loss(pred_imgs, tgt_imgs, mask_img)
+                        additional_loss = additional_loss + self.train_config.loss_cross_patch_coef * tex_cross_patch
+                    
+                    if getattr(self.train_config, 'loss_multiscale_coef', 0.0) > 0:
+                        tex_multiscale = self.multiscale_loss(pred_imgs, tgt_imgs, mask_img)
+                        additional_loss = additional_loss + self.train_config.loss_multiscale_coef * tex_multiscale
+                    
+                    # Global Period Anchor - CRITICAL for preventing period drift!
+                    if getattr(self.train_config, 'loss_anchor_coef', 0.0) > 0:
+                        tex_anchor = self.global_period_anchor_loss(pred_imgs, tgt_imgs, mask_img)
+                        additional_loss = additional_loss + self.train_config.loss_anchor_coef * tex_anchor
                 elif self.train_config.texture_loss == "Phase":
-                    print("Phase")
                     tex_ph = self.phase_loss(pred_imgs, tgt_imgs, mask_img)
-                    additional_loss = additional_loss + tex_ph
+                    additional_loss = tex_ph
                     if step % 50 == 0:  # лог
                         diag = self.phase_loss.diagnostics(pred_imgs, tgt_imgs, mask_img)
                         print(
                             f"[step {step}] PCL diag: "
                             f"center_prob={diag['center_prob']:.3f}  PCE={diag['PCE']:.2f}")
                 elif self.train_config.texture_loss == "SpectralPeriodLoss":
-                    print("SpectralPeriodLoss")
-                    tex_sp = self.spectral_period_loss(pred_imgs, tgt_imgs, mask_img)
-                    additional_loss = additional_loss +  tex_sp
+                    ft = self.spectral_period_loss.get_peak_center(tgt_imgs, mask_img)           
+                    tex_sp = self.spectral_period_loss(pred_imgs, tgt_imgs, mask_img, center_override=ft)
+                    additional_loss = tex_sp
 
                 elif self.train_config.texture_loss == "LogPolarAlignLoss":
-                    print("LogPolarAlignLoss")
                     tex_lp = self.logpolar_loss(pred_imgs, tgt_imgs, mask_img)
-                    additional_loss = additional_loss + tex_lp
+                    additional_loss = tex_lp
 
                 elif self.train_config.texture_loss == "ACFPeriodLoss":
-                    print("ACFPerdiodLoss")
                     tex_acf = self.acf_period_loss(pred_imgs, tgt_imgs, mask_img)
-                    additional_loss = additional_loss + tex_acf
+                    additional_loss = tex_acf
 
                 elif self.train_config.texture_loss == "local":
-                    print("local")
                     tex_local = self.local_texture_loss(pred_imgs, tgt_imgs, mask_img)
-                    additional_loss = additional_loss + tex_local
-                print(f"BETA: {final_beta}")
-                print(f"LOSS {loss} and {additional_loss}")
-                return loss + final_beta * additional_loss
+                    additional_loss = tex_local
+                    
+                if step % 50 == 0:
+                    base = float(loss.detach().cpu())
+                    add  = float(additional_loss.detach().mean().cpu())
+                    print(
+                        f"[step {step}] tex: beta={final_beta:.3f} gate={gate_mean_val:.3f} "
+                        f"base={base:.4f} add={add:.4f}"
+                        f"{self.train_config}"
+                    )
+                return loss + (final_beta*gate_mean) * additional_loss
         return loss
 
 
@@ -2225,7 +2314,11 @@ class SDTrainer(BaseSDTrainProcess):
                             mask_multiplier=mask_multiplier,
                             prior_pred=prior_to_calculate_loss,
                         )
-                    
+                    if loss.ndim > 0:
+                        loss = loss.mean()
+                    if torch.isnan(loss).any():
+                        print_acc("loss is nan")
+                        loss = torch.zeros((), device=loss.device, dtype=loss.dtype, requires_grad=True)    
                     if self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation:
                         # send the loss backwards otherwise checkpointing will fail
                         self.accelerator.backward(loss)
@@ -2258,10 +2351,6 @@ class SDTrainer(BaseSDTrainProcess):
                         # require grad again so the backward wont fail
                         loss.requires_grad_(True)
                         
-                # check if nan
-                if torch.isnan(loss):
-                    print_acc("loss is nan")
-                    loss = torch.zeros_like(loss).requires_grad_(True)
 
                 with self.timer('backward'):
                     # todo we have multiplier seperated. works for now as res are not in same batch, but need to change
