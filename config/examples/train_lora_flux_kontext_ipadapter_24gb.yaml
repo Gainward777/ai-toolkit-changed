@@ -1,0 +1,83 @@
+---
+job: extension
+config:
+  # this name will be the folder and filename name
+  name: "my_first_flux_kontext_lora_ipadapter_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+
+      # Train LoRA while always conditioning with a frozen IP-Adapter (reference image).
+      # The reference images are provided via datasets[].clip_image_path (filenames must match target images).
+      adapter:
+        type: "ip" # "ip" or "ip+"
+        train: false
+        name_or_path: "/path/to/ip_adapter_checkpoint.safetensors"
+        image_encoder_arch: "clip"
+        image_encoder_path: "openai/clip-vit-large-patch14"
+        clip_layer: "penultimate_hidden_states"
+        num_tokens: 4
+
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+
+      datasets:
+        - folder_path: "/path/to/target/images/folder"
+          # Flux-Kontext source images (paired editing dataset)
+          control_path: "/path/to/kontext/source/images/folder"
+          # IP-Adapter reference images (same basename as target images)
+          clip_image_path: "/path/to/ipadapter/reference/images/folder"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [ 512, 768 ]
+
+      train:
+        batch_size: 1
+        steps: 3000
+        gradient_accumulation_steps: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: "weighted"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+
+      model:
+        name_or_path: "black-forest-labs/FLUX.1-Kontext-dev"
+        arch: "flux_kontext"
+        quantize: true
+
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 1024
+        height: 1024
+        # You can also specify adapter_image_path per sample to preview specific references.
+        samples:
+          - prompt: "make the person smile  --ctrl_img /path/to/kontext/source/images/folder/person1.jpg"
+            adapter_image_path: "/path/to/ipadapter/reference/images/folder/person1.jpg"
+          - prompt: "turn this image into a cartoon  --ctrl_img /path/to/kontext/source/images/folder/person1.jpg"
+            adapter_image_path: "/path/to/ipadapter/reference/images/folder/person1.jpg"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 20
+
+meta:
+  name: "[name]"
+  version: '1.0'
+

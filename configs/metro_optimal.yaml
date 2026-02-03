@@ -1,0 +1,212 @@
+# =============================================================================
+# METRO TILES - OPTIMAL CONFIG WITH PERIOD ANCHOR
+# =============================================================================
+# Key feature: GlobalPeriodAnchorLoss forces prediction to match target's period
+# This prevents period drift even when dataset has varying tile sizes
+# =============================================================================
+
+---
+job: "extension"
+config:
+  name: "metro_optimal"
+  process:
+    - type: "diffusion_trainer"
+      training_folder: "/app/ai-toolkit/output"
+      sqlite_db_path: "./aitk_db.db"
+      device: "cuda"
+      trigger_word: null
+      performance_log_every: 10
+      
+      # === NETWORK ===
+      network:
+        type: "lora"
+        linear: 32
+        linear_alpha: 32
+        conv: 16
+        conv_alpha: 16
+        lokr_full_rank: true
+        lokr_factor: -1
+        network_kwargs:
+          ignore_if_contains: []
+      
+      # === SAVE ===
+      save:
+        dtype: "bf16"
+        save_every: 250
+        max_step_saves_to_keep: 12
+        save_format: "diffusers"
+        push_to_hub: false
+      
+      # === DATASET ===
+      datasets:
+        - folder_path: "/app/ai-toolkit/datasets/dataset"
+          control_path: "/app/ai-toolkit/datasets/control"
+          mask_path: "/app/ai-toolkit/datasets/mask"
+          mask_min_value: 0.1
+          default_caption: "Replace the wall marked red bounding box with material named metro style white stretcher tiles, preserving the rest of the scene unchanged"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          is_reg: false
+          network_weight: 1
+          resolution:
+            - 1024
+          controls: []
+          shrink_video_to_frames: true
+          num_frames: 1
+      
+      # =======================================================================
+      # TRAINING
+      # =======================================================================
+      train:
+        batch_size: 1
+        steps: 2500
+        gradient_accumulation: 2
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: "weighted"
+        content_or_style: "balanced"
+        
+        optimizer: "adamw8bit"
+        lr: 5e-5
+        optimizer_params:
+          weight_decay: 0.001
+        
+        ema_config:
+          use_ema: true
+          ema_decay: 0.999
+        
+        dtype: "bf16"
+        bypass_guidance_embedding: false
+        unload_text_encoder: false
+        skip_first_sample: false
+        disable_sampling: false
+        loss_type: "mse"
+        
+        # =====================================================================
+        # TEXTURE LOSS - GATE SETTINGS
+        # =====================================================================
+        # These multiply the texture loss: final = base_loss + (beta * gate) * tex_loss
+        texture_loss: "custom"
+        gate: 0.35        # texture loss active when timestep < 65%
+        min_beta: 0.1     # starting multiplier
+        max_beta: 3.0     # max multiplier (high = strong texture loss)
+        is_new: true
+        v_scale: 0.2
+        
+        # =====================================================================
+        # LOSSES - PRIORITY ORDER
+        # =====================================================================
+        
+        # ----- 1. GLOBAL PERIOD ANCHOR (MAIN - prevents period drift) -----
+        # Takes period from TARGET, forces each PREDICTION patch to match it
+        # This is THE KEY loss for your problem with varied dataset!
+        loss_anchor_coef: 2.0          # HIGH priority
+        anchor_patch_size: 96          # small patches = fine control
+        anchor_stride: 48              # dense coverage
+        
+        # ----- 2. LOCAL TEXTURE (texture quality) -----
+        loss_local_coef: 1.0
+        local_patch_size: 192
+        local_stride: 96
+        local_min_coverage: 0.3
+        local_hard_k_frac: 0.3         # focus on 30% worst patches
+        local_hard_k_min: 4
+        local_w_spectral: 0.8
+        local_w_afc: 1.5
+        local_w_phase: 1.0
+        local_w_log: 0.0
+        
+        # ----- 3. SPECTRAL PERIOD (global frequency matching) -----
+        loss_Spect_coef: 0.8
+        r_bins: 128
+        tau: 0.06
+        band_sigma: 0.15
+        w_peak: 1.5
+        w_band: 0.6
+        min_bin: 3
+        
+        # ----- 4. SEAMLESS (edge continuity) -----
+        loss_seamless_coef: 0.5
+        seamless_edge_width: 16
+        seamless_use_gradient: true
+        seamless_multi_scale: false
+        seamless_check_diagonals: true
+        seamless_diagonal_weight: 0.5
+        
+        # ----- 5. CROSS-PATCH (period variance penalty) -----
+        loss_cross_patch_coef: 0.5
+        cross_patch_size: 128
+        cross_patch_stride: 64
+        
+        # ----- 6. AUXILIARY (lower priority) -----
+        loss_multiscale_coef: 0.3
+        multiscale_scales: [1.0, 0.5, 0.25]
+        loss_gradient_coef: 0.2
+        
+        # ----- DISABLED -----
+        loss_AFC_coef: 0.0
+        loss_Phase_coef: 0.0
+        loss_Log_coef: 0.0
+        loss_latent_period_coef: 0.0
+        
+        # unused params (keep for compatibility)
+        afc_r_bins: 128
+        afc_tau: 0.10
+        afc_min_rel: 0.04
+        afc_max_rel: 0.55
+        afc_w: 0.3
+        center_weight: 1.0
+        pce_weight: 0.08
+        temperature: 0.03
+        use_hann: true
+        demean: true
+        exclude_radius: 7
+        log_out_r: 96
+        log_out_t: 180
+        log_r_min: 0.02
+        log_w: 0.08
+        
+        diff_output_preservation: false
+        diff_output_preservation_multiplier: 1
+        diff_output_preservation_class: "person"
+      
+      # =======================================================================
+      # MODEL
+      # =======================================================================
+      model:
+        name_or_path: "black-forest-labs/FLUX.1-Kontext-dev"
+        quantize: true
+        quantize_te: true
+        arch: "flux_kontext"
+        low_vram: false
+        model_kwargs: {}
+      
+      # =======================================================================
+      # SAMPLING
+      # =======================================================================
+      sample:
+        sampler: "flowmatch"
+        sample_every: 300
+        width: 1024
+        height: 1024
+        samples:
+          - prompt: "Replace the wall marked red bounding box with material named metro style white stretcher tiles, preserving the rest of the scene unchanged --ctrl_img /app/ai-toolkit/datasets/sample/photo_2025-11-25_14-27-31.jpg"
+            ctrl_img: "/app/ai-toolkit/datasets/sample/photo_2025-11-25_14-27-31.jpg"
+          - prompt: "Replace the wall marked red bounding box with material named metro style white stretcher tiles, preserving the rest of the scene unchanged --ctrl_img /app/ai-toolkit/datasets/sample/photo_2025-11-25_19-52-10.jpg"
+            ctrl_img: "/app/ai-toolkit/datasets/sample/photo_2025-11-25_19-52-10.jpg"
+          - prompt: "Replace the wall marked red bounding box with material named metro style white stretcher tiles, preserving the rest of the scene unchanged --ctrl_img /app/ai-toolkit/datasets/sample/scene_with_object.png"
+            ctrl_img: "/app/ai-toolkit/datasets/sample/scene_with_object.png"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 25
+        num_frames: 1
+        fps: 1
+
+meta:
+  name: "[name]"
+  version: "1.0"
