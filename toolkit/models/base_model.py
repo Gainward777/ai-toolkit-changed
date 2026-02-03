@@ -242,7 +242,9 @@ class BaseModel:
 
     @property
     def is_flux(self):
-        return self.arch == 'flux'
+        # Treat all Flux-family architectures as flux-like (e.g. flux, flux_kontext).
+        # This matters for adapter + attention processor routing (e.g. IP-Adapter for Flux).
+        return str(self.arch).startswith('flux')
 
     @property
     def is_lumina2(self):
