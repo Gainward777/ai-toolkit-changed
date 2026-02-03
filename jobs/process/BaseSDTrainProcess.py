@@ -1049,22 +1049,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 is_reg = any(batch.get_is_reg_list())
                 if batch.tensor is not None:
                     imgs = batch.tensor
-                    with self.timer('to_device:imgs'):
-                        imgs = imgs.to(self.device_torch, dtype=dtype)
+                    imgs = imgs.to(self.device_torch, dtype=dtype)
                     # dont adjust for regs.
                     if self.train_config.img_multiplier is not None and not is_reg:
                         # do it ad contrast
                         imgs = reduce_contrast(imgs, self.train_config.img_multiplier)
                 if batch.latents is not None:
-                    # When latents are cached to disk, DataLoader yields CPU tensors and we pay CPU->GPU copy here.
-                    latents_cpu = batch.latents
-                    with self.timer('to_device:latents'):
-                        latents = latents_cpu.to(self.device_torch, dtype=dtype)
+                    latents = batch.latents.to(self.device_torch, dtype=dtype)
                     batch.latents = latents
-                    try:
-                        del latents_cpu
-                    except Exception:
-                        pass
                 else:
                     # normalize to
                     if self.train_config.standardize_images:
@@ -1092,17 +1084,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                     latents = self.sd.encode_images(imgs)
                     batch.latents = latents
-
-                # Optional: if control latents were cached alongside normal latents (e.g. Flux-Kontext),
-                # move them to the training device here to avoid per-step device work later.
-                if hasattr(batch, "control_latents") and getattr(batch, "control_latents", None) is not None:
-                    ctrl_cpu = batch.control_latents
-                    with self.timer('to_device:control_latents'):
-                        batch.control_latents = ctrl_cpu.to(self.device_torch, dtype=dtype)
-                    try:
-                        del ctrl_cpu
-                    except Exception:
-                        pass
 
                 if self.train_config.standardize_latents:
                     if self.sd.is_xl or self.sd.is_vega or self.sd.is_ssd:
@@ -1765,10 +1746,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
 
 
-                # Keep LoRA/network weights in a configurable dtype (default fp32 for stability).
-                # For low-VRAM, setting network.lora_weight_dtype to bf16/fp16 can significantly reduce VRAM.
-                network_weight_dtype = get_torch_dtype(getattr(self.network_config, "lora_weight_dtype", "float32"))
-                self.network.force_to(self.device_torch, dtype=network_weight_dtype)
+                # todo switch everything to proper mixed precision like this
+                self.network.force_to(self.device_torch, dtype=torch.float32)
                 # give network to sd so it can use it
                 self.sd.network = self.network
                 self.network._update_torch_multiplier()
@@ -2025,16 +2004,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
-            with self.timer('sample:first'):
-                self.sample(0, is_first=True)
+            self.sample(0, is_first=True)
 
         # sample first
         if self.train_config.skip_first_sample or self.train_config.disable_sampling:
             print_acc("Skipping first sample due to config setting")
         elif self.step_num <= 1 or self.train_config.force_first_sample:
             print_acc("Generating baseline samples before training")
-            with self.timer('sample:baseline'):
-                self.sample(self.step_num)
+            self.sample(self.step_num)
         
         if self.accelerator.is_local_main_process:
             self.progress_bar = ToolkitProgressBar(
@@ -2181,9 +2158,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             did_oom = False
             loss_dict = None
             try:
-                with self.timer('hook_train_loop'):
-                    with self.accelerator.accumulate(self.modules_being_trained):
-                        loss_dict = self.hook_train_loop(batch_list)
+                with self.accelerator.accumulate(self.modules_being_trained):
+                    loss_dict = self.hook_train_loop(batch_list)
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
@@ -2261,8 +2237,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
                         print_acc(f"\nSaving at step {self.step_num}")
-                        with self.timer('save'):
-                            self.save(self.step_num)
+                        self.save(self.step_num)
                         self.ensure_params_requires_grad()
                         # clear any grads
                         optimizer.zero_grad()
@@ -2278,8 +2253,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         # print above the progress bar
                         if self.train_config.free_u:
                             self.sd.pipeline.disable_freeu()
-                        with self.timer('sample:step'):
-                            self.sample(self.step_num)
+                        self.sample(self.step_num)
                         if self.train_config.unload_text_encoder:
                             # make sure the text encoder is unloaded
                             self.sd.text_encoder_to('cpu')
